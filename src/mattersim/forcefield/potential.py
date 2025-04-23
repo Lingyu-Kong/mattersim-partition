@@ -2,12 +2,13 @@
 """
 Potential
 """
+
 import os
 import pickle
 import random
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -18,20 +19,20 @@ from ase.calculators.calculator import Calculator
 from ase.constraints import full_3x3_to_voigt_6_stress
 from ase.units import GPa
 from deprecated import deprecated
+from loguru import logger
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from torch_ema import ExponentialMovingAverage
 from torch_geometric.loader import DataLoader
 from torchmetrics import MeanMetric
+from torch_runstats.scatter import scatter
 
 from mattersim.datasets.utils.build import build_dataloader
 from mattersim.forcefield.m3gnet.m3gnet import M3Gnet
 from mattersim.jit_compile_tools.jit import compile_mode
 from mattersim.utils.download_utils import download_checkpoint
-from mattersim.utils.logger_utils import get_logger
 
 rank = int(os.getenv("RANK", 0))
-logger = get_logger()
 
 
 @compile_mode("script")
@@ -71,7 +72,9 @@ class Potential(nn.Module):
             step_size = kwargs.get("step_size", 10)
             gamma = kwargs.get("gamma", 0.95)
             self.scheduler = StepLR(
-                self.optimizer, step_size=step_size, gamma=gamma  # noqa: E501
+                self.optimizer,
+                step_size=step_size,
+                gamma=gamma,  # noqa: E501
             )
         elif scheduler == "ReduceLROnPlateau":
             factor = kwargs.get("factor", 0.8)
@@ -97,13 +100,13 @@ class Potential(nn.Module):
             self.ema = ema
         self.model_name = kwargs.get("model_name", "m3gnet")
         self.validation_metrics = kwargs.get(
-            "validation_metrics", {"loss": 10000000.0}  # noqa: E501
+            "validation_metrics",
+            {"loss": 10000000.0},  # noqa: E501
         )
         self.last_epoch = kwargs.get("last_epoch", -1)
         self.description = kwargs.get("description", "")
         self.saved_name = ["loss", "MAE_energy", "MAE_force", "MAE_stress"]
-        self.best_metric = 10000
-        self.best_metric_epoch = 0
+        self.best_metric = 10
         self.rank = None
 
         self.use_finetune_label_loss = kwargs.get("use_finetune_label_loss", False)
@@ -259,9 +262,7 @@ class Potential(nn.Module):
                     atoms_train_sampler = (
                         torch.utils.data.distributed.DistributedSampler(
                             train_data,
-                            seed=kwargs.get("seed", 42)
-                            + idx * 131
-                            + epoch,  # noqa: E501
+                            seed=kwargs.get("seed", 42) + idx * 131 + epoch,  # noqa: E501
                         )
                     )
                     train_dataloader = DataLoader(
@@ -271,7 +272,7 @@ class Potential(nn.Module):
                         num_workers=0,
                         sampler=atoms_train_sampler,
                     )
-                    metric = self.train_one_epoch(
+                    self.train_one_epoch(
                         train_dataloader,
                         epoch,
                         loss,
@@ -289,7 +290,7 @@ class Potential(nn.Module):
                     del train_data
                     torch.cuda.empty_cache()
             else:
-                metric = self.train_one_epoch(
+                self.train_one_epoch(
                     dataloader,
                     epoch,
                     loss,
@@ -303,21 +304,20 @@ class Potential(nn.Module):
                     mode="train",
                     **kwargs,
                 )
-            if val_dataloader is not None:
-                metric = self.train_one_epoch(
-                    val_dataloader,
-                    epoch,
-                    loss,
-                    include_energy,
-                    include_forces,
-                    include_stresses,
-                    force_loss_ratio,
-                    stress_loss_ratio,
-                    wandb,
-                    is_distributed,
-                    mode="val",
-                    **kwargs,
-                )
+            metric = self.train_one_epoch(
+                val_dataloader,
+                epoch,
+                loss,
+                include_energy,
+                include_forces,
+                include_stresses,
+                force_loss_ratio,
+                stress_loss_ratio,
+                wandb,
+                is_distributed,
+                mode="val",
+                **kwargs,
+            )
 
             if isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(metric)
@@ -333,6 +333,7 @@ class Potential(nn.Module):
                 "MAE_stress": metric[3],
             }
             if is_distributed:
+                # TODO add distributed early stopping
                 if self.save_model_ddp(
                     epoch,
                     early_stop_patience,
@@ -384,9 +385,7 @@ class Potential(nn.Module):
                 if (
                     save_checkpoint is True
                     and metric[self.idx]
-                    < best_model["validation_metrics"][
-                        self.saved_name[self.idx]
-                    ]  # noqa: E501
+                    < best_model["validation_metrics"][self.saved_name[self.idx]]  # noqa: E501
                 ):
                     self.save(os.path.join(save_path, "best_model.pth"))
                 if epoch > best_model["last_epoch"] + early_stop_patience:
@@ -428,13 +427,9 @@ class Potential(nn.Module):
             # so this operation should not be performed.
             # Only save the model on GPU 0,
             # the model on each GPU should be exactly the same.
-            if epoch > self.best_metric_epoch + early_stop_patience:
-                logger.info("Early stopping")
-                return True
 
             if metric[self.idx] < self.best_metric:
                 self.best_metric = metric[self.idx]
-                self.best_metric_epoch = epoch
                 if save_checkpoint and self.rank == 0:
                     self.save(os.path.join(save_path, "best_model.pth"))
             if self.rank == 0 and save_checkpoint:
@@ -477,14 +472,17 @@ class Potential(nn.Module):
         include_forces: bool = False,
         include_stresses: bool = False,
         **kwargs,
-    ) -> Tuple[List[float], List[np.ndarray], List[np.ndarray]]:
+    ):
         """
         Predict properties (e.g., energies, forces) given a well-trained model
         Return: results tuple
             - results[0] (list[float]): a list of energies
             - results[1] (list[np.ndarray]): a list of atomic forces
-            - results[2] (list[np.ndarray]): a list of stresses (in GPa)
+            - results[2] (list[np.ndarray]): a list of stresses
         """
+        logger.warning(
+            "The unit of stress is GPa when using the predict_properties function."
+        )
         self.model.eval()
         energies = []
         forces = []
@@ -584,7 +582,9 @@ class Potential(nn.Module):
                 self.optimizer.zero_grad()
                 loss_.backward()
                 nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 1.0, norm_type=2  # noqa: E501
+                    self.model.parameters(),
+                    1.0,
+                    norm_type=2,  # noqa: E501
                 )
                 self.optimizer.step()
                 # scaler.scale(loss_).backward()
@@ -641,7 +641,8 @@ class Potential(nn.Module):
                 step=epoch,
             )
 
-        return (loss_avg_, e_mae, f_mae, s_mae)
+        if mode == "val":
+            return (loss_avg_, e_mae, f_mae, s_mae)
 
     def loss_calc(
         self,
@@ -728,6 +729,8 @@ class Potential(nn.Module):
         include_forces: bool = True,
         include_stresses: bool = True,
         dataset_idx: int = -1,
+        return_intermediate: bool = False,
+        root_indices_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         get energy, force and stress from a list of graph
@@ -747,7 +750,6 @@ class Potential(nn.Module):
             raise NotImplementedError
         else:
             strain = torch.zeros_like(input["cell"], device=self.device)
-            volume = torch.linalg.det(input["cell"])
             if include_forces is True:
                 input["atom_pos"].requires_grad_(True)
             if include_stresses is True:
@@ -766,8 +768,21 @@ class Potential(nn.Module):
                 )
                 volume = torch.linalg.det(input["cell"])
 
-            energies = self.model.forward(input, dataset_idx)
-            output["total_energy"] = energies
+            if return_intermediate:
+                energies, intermediate = self.model.forward(
+                    input, dataset_idx, return_intermediate
+                )
+                output["intermediate"] = intermediate
+            else:
+                energies, energies_i = self.model.forward(input, dataset_idx, return_intermediate, return_energies_per_atom=True)
+                if root_indices_mask is None:
+                    output["total_energy"] = energies
+                else:
+                    batch = input["batch"]
+                    num_graphs = input["num_graphs"]
+                    energies = scatter(energies_i * root_indices_mask, batch, dim=0, dim_size=num_graphs)
+                    output["total_energy"] = energies
+            output["total_energy_i"] = energies_i
 
             # Only take first derivative if only force is required
             if include_forces is True and include_stresses is False:
@@ -896,7 +911,6 @@ class Potential(nn.Module):
         checkpoint = torch.load(load_path, map_location=device)
 
         assert checkpoint["model_name"] == model_name
-        checkpoint["model_args"].update(kwargs)
         model = M3Gnet(device=device, **checkpoint["model_args"]).to(device)
         model.load_state_dict(checkpoint["model"], strict=False)
 
@@ -968,36 +982,23 @@ class Potential(nn.Module):
         if model_name.lower() != "m3gnet":
             raise NotImplementedError
 
-        checkpoint_folder = os.path.expanduser("~/.local/mattersim/pretrained_models")
-        os.makedirs(checkpoint_folder, exist_ok=True)
+        current_dir = os.path.dirname(__file__)
         if (
             load_path is None
             or load_path.lower() == "mattersim-v1.0.0-1m.pth"
             or load_path.lower() == "mattersim-v1.0.0-1m"
         ):
-            load_path = os.path.join(checkpoint_folder, "mattersim-v1.0.0-1M.pth")
-            if not os.path.exists(load_path):
-                logger.info(
-                    "The pre-trained model is not found locally, "
-                    "attempting to download it from the server."
-                )
-                download_checkpoint(
-                    "mattersim-v1.0.0-1M.pth", save_folder=checkpoint_folder
-                )
+            load_path = os.path.join(
+                current_dir, "..", "pretrained_models/mattersim-v1.0.0-1M.pth"
+            )
             logger.info(f"Loading the pre-trained {os.path.basename(load_path)} model")
         elif (
             load_path.lower() == "mattersim-v1.0.0-5m.pth"
             or load_path.lower() == "mattersim-v1.0.0-5m"
         ):
-            load_path = os.path.join(checkpoint_folder, "mattersim-v1.0.0-5M.pth")
-            if not os.path.exists(load_path):
-                logger.info(
-                    "The pre-trained model is not found locally, "
-                    "attempting to download it from the server."
-                )
-                download_checkpoint(
-                    "mattersim-v1.0.0-5M.pth", save_folder=checkpoint_folder
-                )
+            load_path = os.path.join(
+                current_dir, "..", "pretrained_models/mattersim-v1.0.0-5M.pth"
+            )
             logger.info(f"Loading the pre-trained {os.path.basename(load_path)} model")
         else:
             logger.info("Loading the model from %s" % load_path)
@@ -1007,7 +1008,6 @@ class Potential(nn.Module):
         checkpoint = torch.load(load_path, map_location=device)
 
         assert checkpoint["model_name"] == model_name
-        checkpoint["model_args"].update(kwargs)
         model = M3Gnet(device=device, **checkpoint["model_args"]).to(device)
         model.load_state_dict(checkpoint["model"], strict=False)
 
@@ -1185,23 +1185,8 @@ class DeepCalculator(Calculator):
 
         self.args_dict["batch_size"] = 1
         self.args_dict["only_inference"] = 1
-        cutoff = (
-            self.potential.model.model_args["cutoff"]
-            if self.potential.model_name == "m3gnet"
-            else 5.0
-        )
-        threebody_cutoff = (
-            self.potential.model.model_args["threebody_cutoff"]
-            if self.potential.model_name == "m3gnet"
-            else 4.0
-        )
-
         dataloader = build_dataloader(
-            [atoms],
-            model_type=self.potential.model_name,
-            cutoff=cutoff,
-            threebody_cutoff=threebody_cutoff,
-            **self.args_dict,
+            [atoms], model_type=self.potential.model_name, **self.args_dict
         )
         for graph_batch in dataloader:
             # Resemble input dictionary
@@ -1237,6 +1222,8 @@ class DeepCalculator(Calculator):
                 )
 
 
+import time
+
 class MatterSimCalculator(Calculator):
     """
     Deep calculator based on ase Calculator
@@ -1269,6 +1256,9 @@ class MatterSimCalculator(Calculator):
         self.stress_weight = stress_weight
         self.args_dict = args_dict
         self.device = device
+        
+        self.prepare_time_list = []
+        self.forward_time_list = []
 
     @classmethod
     def from_checkpoint(cls, load_path: str, **kwargs):
@@ -1326,6 +1316,7 @@ class MatterSimCalculator(Calculator):
         Returns:
         """
 
+        time1 = time.time()
         all_changes = [
             "positions",
             "numbers",
@@ -1338,29 +1329,16 @@ class MatterSimCalculator(Calculator):
         properties = properties or ["energy"]
         system_changes = system_changes or all_changes
         super().calculate(
-            atoms=atoms, properties=properties, system_changes=system_changes
+            atoms=atoms
         )
 
         self.args_dict["batch_size"] = 1
         self.args_dict["only_inference"] = 1
-        cutoff = (
-            self.potential.model.model_args["cutoff"]
-            if self.potential.model_name == "m3gnet"
-            else 5.0
-        )
-        threebody_cutoff = (
-            self.potential.model.model_args["threebody_cutoff"]
-            if self.potential.model_name == "m3gnet"
-            else 4.0
-        )
-
         dataloader = build_dataloader(
-            [atoms],
-            model_type=self.potential.model_name,
-            cutoff=cutoff,
-            threebody_cutoff=threebody_cutoff,
-            **self.args_dict,
+            [atoms], model_type=self.potential.model_name, **self.args_dict
         )
+        self.prepare_time_list.append(time.time() - time1)
+        time1 = time.time()
         for graph_batch in dataloader:
             # Resemble input dictionary
             if (
@@ -1393,3 +1371,4 @@ class MatterSimCalculator(Calculator):
                         result["stresses"].detach().cpu().numpy()[0]
                     )
                 )
+        self.forward_time_list.append(time.time() - time1)
